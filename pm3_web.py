@@ -232,16 +232,19 @@ def analyze_card(info_text: str) -> dict:
         res["command"] = None
         res["summary"] = "检测到 MIFARE DESFire (AES/3DES)。\n本工具的 Classic 破解方法不适用。"
     elif res["chip"].startswith("Fudan FM11RF08S"):
-        # FM11RF08S 系列有专用后门, 优先用专用恢复脚本, 而非通用 autopwn
-        res["method"] = f"检测到 {res['chip']} (带后门) → 专用脚本 fm11rf08s_recovery"
-        res["command"] = "script run fm11rf08s_recovery"
-        res["timeout"] = 2700
+        # FM11RF08S 带后门 + 静态加密随机数, 用原生 `hf mf sen` 做密码学恢复:
+        # 它能恢复全部密钥(含隐藏 OOB 扇区)并在线校验, 比通用 autopwn 和
+        # 旧的字典脚本更完整可靠 (固件 info 也提示 Try `hf mf sen`)。
+        res["method"] = f"检测到 {res['chip']} (带后门/静态加密随机数) → 原生 hf mf sen"
+        res["command"] = "hf mf sen"
+        res["timeout"] = 1200
         res["summary"] = (
             f"芯片指纹: {res['chip']}\n"
             f"容量: {res['size_name'] or 'Classic 1K'}\n"
-            "该芯片带后门, 走专用恢复脚本最快最稳:\n"
-            "→ 执行命令: script run fm11rf08s_recovery\n"
-            "(如需完整 dump 可用「脚本攻击」页的 fm11rf08s_full -r)")
+            "该芯片带后门且为静态加密随机数, 用原生攻击恢复并校验全部密钥:\n"
+            "→ 执行命令: hf mf sen\n"
+            "(注: 若卡的普通扇区本就是默认密钥, 恢复结果就是 FFFFFFFFFFFF, 这是正确的;\n"
+            " 需要完整 dump/解码可用「脚本攻击」页的 fm11rf08s_full -r)")
     else:
         if res["static"] == "static_enc":
             res["method"] = "静态加密随机数 → staticnested (autopwn 自动处理)"
@@ -512,6 +515,14 @@ class Engine:
             self.session = None
             self.push_state()
             return {"ok": False, "message": str(e)}
+        # 让 pm3 把所有 dump/key 文件保存到用户选定的"保存目录"。
+        # 交互模式下 pm3 默认把文件存到 home 目录, 内置 py 脚本也用该路径,
+        # 不设置的话工具就找不到脚本恢复出来的密钥文件。
+        if savedir:
+            try:
+                self.session.run(f'prefs set savepaths --dump "{savedir}"', timeout=10)
+            except Exception:
+                pass
         if not (self.worker and self.worker.is_alive()):
             self.worker = threading.Thread(target=self._job_loop, daemon=True)
             self.worker.start()
@@ -574,29 +585,40 @@ class Engine:
         return {"ok": True}
 
     # ----- 文件解析 ----- #
+    def _find_saved(self, uid, suffix):
+        """按 UID 在保存目录 / home 目录里查找已生成的文件, 返回存在的完整路径。"""
+        name = f"hf-mf-{uid}-{suffix}"
+        for d in (self.savedir, os.path.expanduser("~"), os.getcwd()):
+            if not d:
+                continue
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
     def capture_files(self, result):
         dump = keys = uid = None
-        m = re.search(r"(hf-mf-[0-9A-Fa-f]+)-dump\.bin", result)
+        # 优先抓取命令输出里打印的"完整路径"(脚本/原生命令可能存到不同目录),
+        # 路径可能是绝对路径(如 /Users/xxx/hf-mf-...-key.bin)或仅文件名。
+        # 文件名可能带自增后缀, 如 hf-mf-<uid>-key-001.bin
+        m = re.search(r"([^\s`'\"]*hf-mf-[0-9A-Fa-f]+-dump(?:-\d+)?\.bin)", result)
         if m:
-            dump = m.group(0)
-            uid = re.search(r"hf-mf-([0-9A-Fa-f]+)-dump", result).group(1)
-        m2 = re.search(r"(hf-mf-[0-9A-Fa-f]+)-key\.bin", result)
+            dump = m.group(1)
+            uid = re.search(r"hf-mf-([0-9A-Fa-f]+)-dump", dump).group(1)
+        m2 = re.search(r"([^\s`'\"]*hf-mf-[0-9A-Fa-f]+-key(?:-\d+)?\.bin)", result)
         if m2:
-            keys = m2.group(0)
+            keys = m2.group(1)
             if not uid:
-                uid = re.search(r"hf-mf-([0-9A-Fa-f]+)-key", result).group(1)
+                uid = re.search(r"hf-mf-([0-9A-Fa-f]+)-key", keys).group(1)
         if not uid:
             u = parse_uid(result)
             if u:
                 uid = normalize_uid(u)
+        # 回退: 按 UID 在保存目录 / home 目录里找
         if uid and not dump:
-            cand = os.path.join(self.savedir, f"hf-mf-{uid}-dump.bin")
-            if os.path.isfile(cand):
-                dump = f"hf-mf-{uid}-dump.bin"
+            dump = self._find_saved(uid, "dump.bin")
         if uid and not keys:
-            cand = os.path.join(self.savedir, f"hf-mf-{uid}-key.bin")
-            if os.path.isfile(cand):
-                keys = f"hf-mf-{uid}-key.bin"
+            keys = self._find_saved(uid, "key.bin")
         if uid:
             self.source_uid = uid
         if dump:
@@ -648,12 +670,24 @@ class Engine:
         if changed:
             self.broadcast("cardinfo", self.cardinfo)
 
-    def read_keys(self):
-        if not self.source_keys:
+    def _resolve(self, path):
+        """把可能是相对名的文件解析成实际存在的完整路径 (保存目录 / home / cwd)。"""
+        if not path:
             return None
-        path = self.source_keys
-        if not os.path.isabs(path):
-            path = os.path.join(self.savedir, path)
+        if os.path.isabs(path):
+            return path if os.path.isfile(path) else None
+        for d in (self.savedir, os.path.expanduser("~"), os.getcwd()):
+            if not d:
+                continue
+            p = os.path.join(d, path)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def read_keys(self):
+        path = self._resolve(self.source_keys)
+        if not path:
+            return None
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -672,15 +706,15 @@ class Engine:
     def push_keys(self):
         k = self.read_keys()
         if k is not None:
-            self.broadcast("keys", {"file": self.source_keys, "sectors": k})
+            self.broadcast("keys", {"file": os.path.basename(self.source_keys or ""), "sectors": k})
 
     def read_dump(self):
         """读取 dump.bin, 返回按块解析的内容 (含所属扇区/是否扇区尾块)。"""
         if not self.source_dump or not self.source_dump.endswith(".bin"):
             return None
-        path = self.source_dump
-        if not os.path.isabs(path):
-            path = os.path.join(self.savedir, path)
+        path = self._resolve(self.source_dump)
+        if not path:
+            return None
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -704,7 +738,7 @@ class Engine:
     def push_dump(self):
         d = self.read_dump()
         if d is not None:
-            self.broadcast("dump", {"file": self.source_dump, "blocks": d})
+            self.broadcast("dump", {"file": os.path.basename(self.source_dump or ""), "blocks": d})
 
     def list_dumps(self):
         out = []
@@ -1045,8 +1079,10 @@ const TABS = {
  '脚本攻击': [
    {html:'<div class="tip">调用 pm3 内置 Python 脚本 (client/pyscripts) 的进阶密钥恢复。以下为已在本机客户端实测可加载运行的脚本 (耗时可能较长)。</div>'},
    {html:'<div class="tip" style="color:var(--accent2)">— Fudan FM11RF08S / FM11RF08 (带后门的 MIFARE Classic 仿制卡) —</div>'},
-   {t:'FM11RF08S 密钥恢复 (recovery)', c:()=>run('FM11RF08S恢复','script run fm11rf08s_recovery',2700), pri:1,
-     tip:'综合后门攻击恢复全部密钥, 视密钥复用情况约 1~30 分钟'},
+   {t:'★ FM11RF08S 密钥恢复 (hf mf sen, 推荐)', c:()=>run('FM11RF08S sen','hf mf sen',1200), pri:1,
+     tip:'原生静态加密随机数攻击, 密码学恢复并在线校验全部密钥(含隐藏 OOB 扇区)。智能获取密钥也是用它'},
+   {t:'FM11RF08S 字典恢复 (script recovery)', c:()=>run('FM11RF08S恢复','script run fm11rf08s_recovery',2700),
+     tip:'旧的字典/脚本方式, 较慢且可能漏掉非默认密钥; 一般用上面的 sen 即可'},
    {t:'FM11RF08S 全量恢复+Dump (full -r)', c:()=>run('FM11RF08S全量','script run fm11rf08s_full -r',2700),
      tip:'恢复密钥并完整 dump (含 Bambu/MAD 解码)'},
    {t:'后门 Dump (mf_backdoor_dump)', c:()=>run('后门Dump','script run mf_backdoor_dump',600),
