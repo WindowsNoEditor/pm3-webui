@@ -1,0 +1,19 @@
+# Proxmark3 固件/客户端源码 — 请按 README 单独 clone, 不纳入本仓库
+proxmark3/
+
+# 卡片数据 (含密钥 / UID, 切勿上传!)
+pm3_data/
+*.bin
+*.eml
+hf-mf-*.json
+hf-mf-*-key*
+hf-mf-*-dump*
+lf-*.json
+
+# 本工具运行时配置 (含本机路径)
+.pm3_gui_config.json
+
+# Python / 系统杂项
+__pycache__/
+*.pyc
+.DS_Store
